@@ -1842,7 +1842,9 @@ function applyShadowToggles() {
   ground.visible = state.shadows && state.ground;
   ambient.visible = state.shadows;
   refreshMaterials();
-  document.querySelectorAll('.light-section').forEach(el => el.classList.toggle('paused', !state.shadows));
+  // With Shadows off the model is shown flat, so every light (and its options) is greyed out and unclickable.
+  document.querySelectorAll('.light-section').forEach(el => { el.classList.toggle('paused', !state.shadows); dim(el, !state.shadows); });
+  if (typeof syncStyleUI === 'function') { syncStyleUI(); syncLookUI(); }
   updateLights();
 }
 
@@ -3496,8 +3498,10 @@ function dim(el, off) {
   if (off) el.setAttribute('inert', ''); else el.removeAttribute('inert');
 }
 function syncStyleUI() {
-  dim($('body-cel'), !state.cel);
-  dim($('aoRange').closest('.ctrl'), state.cel);   // occlusion isn't used in cel shading
+  // Cel shading and occlusion only apply while Shadows is on (Lighting tab); flat display ignores them.
+  dim($('cel').closest('.switch'), !state.shadows);
+  dim($('body-cel'), !state.cel || !state.shadows);
+  dim($('aoRange').closest('.ctrl'), state.cel || !state.shadows);   // occlusion isn't used in cel shading
   dim($('body-lines'), !state.lines);
   $('cel').checked = state.cel;
   $('celMetal').checked = state.celMetal;
@@ -3532,7 +3536,11 @@ updateCelGradient(); updateAmbient(); syncStyleUI();
 const gl = renderer.getContext();
 const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
 const MAX_DIM = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), vp[0], vp[1], 8192);
-const MAX_PIXELS = 8192 * 8192;
+// Largest render the browser will really give us. Some browsers (Safari especially) quietly hand over a
+// smaller drawing buffer than requested; when that happens we learn the real size and render smaller.
+let MAX_PIXELS = 8192 * 8192;
+// Safari caps any canvas at about 16.7 million pixels (4096 x 4096), so start there instead of finding out.
+if (/^((?!chrome|chromium|crios|android|edg).)*safari/i.test(navigator.userAgent)) MAX_PIXELS = 4096 * 4096;
 const exportWidthSel = $('exportWidth');
 [2000, 3000, 4000, 6000, 8000].filter(w => w <= MAX_DIM).forEach(w => {
   const o = document.createElement('option'); o.value = w; o.textContent = w + ' px';
@@ -3855,6 +3863,14 @@ function renderToCanvas(W, H, layer) {
   const prevAspect = camera.aspect;
   renderer.setPixelRatio(1);
   renderer.setSize(W, H, false);
+  if (gl.drawingBufferWidth < W || gl.drawingBufferHeight < H) {
+    // The browser shrank the canvas. Rendering now would draw the image offset and at the wrong scale
+    // (and the rim light pass, which renders separately, wouldn't line up), so stop and retry smaller.
+    const got = gl.drawingBufferWidth * gl.drawingBufferHeight;
+    renderer.setPixelRatio(prevPR); renderer.setSize(prevSize.x, prevSize.y, false);
+    camera.aspect = prevAspect; applyProjection(); needsRender = true;
+    const e = new Error('The browser could not render an image this large.'); e.clampedTo = got; throw e;
+  }
   camera.aspect = W / H; applyProjection();
   renderLayer(layer || 'full');
   const bw = gl.drawingBufferWidth, bh = gl.drawingBufferHeight;
@@ -4121,6 +4137,15 @@ function stackLayers(canvases, layers) {
 }
 // Renders the chosen layers at the export size. Returns aligned canvases (colors, shadows, lines order).
 function produceLayers(layers, target, quick) {
+  for (let tries = 0; ; tries++) {
+    try { return produceLayersOnce(layers, target, quick); }
+    catch (e) {
+      if (!e.clampedTo || tries >= 4) throw e;
+      MAX_PIXELS = Math.max(256 * 256, Math.floor(e.clampedTo * 0.95));   // remember the real limit
+    }
+  }
+}
+function produceLayersOnce(layers, target, quick) {
   const aspect = camera.aspect;
   const fr = frameFractions();
   if (fr) {
@@ -4140,9 +4165,8 @@ function produceLayers(layers, target, quick) {
   // The box covers everything any layer could show: the lit model with its ground shadow, lines and shadows.
   const boxOf = (W, H) => {
     const op = shadowMaskOpacity; shadowMaskOpacity = 1;
-    const b = unionBounds(['lit', 'lines', 'shadows'].map(l => alphaBounds(renderToCanvas(W, H, l))));
-    shadowMaskOpacity = op;
-    return b;
+    try { return unionBounds(['lit', 'lines', 'shadows'].map(l => alphaBounds(renderToCanvas(W, H, l)))); }
+    finally { shadowMaskOpacity = op; }
   };
   let W0 = target, limited = false;
   if (!quick) {
@@ -4340,6 +4364,9 @@ async function requestPersistence() {
 async function autoAddToLibrary() {
   const src = currentSource;
   if (!src || src.libId) return;
+  // Capture the name now: by the time storage answers, another model may already be open.
+  const name = currentModelName;
+  const stillShown = () => currentSource === src;
   try {
     const main = src.files[0];
     const size = src.files.reduce((n, f) => n + f.size, 0);
@@ -4347,16 +4374,19 @@ async function autoAddToLibrary() {
     const same = recs.find(r => r.files && r.files[0] && r.files[0].name === main.name && r.size === size);
     if (same) {
       src.libId = same.id;
-      if (same.view) {
+      if (same.view && stillShown()) {
         camera.position.fromArray(same.view.pos); controls.target.fromArray(same.view.target);
         camAnim = null; controls.update(); requestRender();
       }
       same.updated = Date.now(); await libPut(same);
     } else {
       await new Promise(r => setTimeout(r, 150));
+      // The preview and camera angle are only taken if this model is still the one on screen;
+      // otherwise the entry gets its preview the next time it's opened.
+      const shown = stillShown();
       const rec = {
-        id: newId(), name: currentModelName, created: Date.now(), updated: Date.now(), size,
-        files: src.files.map(f => ({ name: f.name, blob: f })), thumb: makeThumbnail(), view: currentView()
+        id: newId(), name, created: Date.now(), updated: Date.now(), size,
+        files: src.files.map(f => ({ name: f.name, blob: f })), thumb: shown ? makeThumbnail() : null, view: shown ? currentView() : null
       };
       await libPut(rec);
       src.libId = rec.id;
@@ -4607,9 +4637,10 @@ function syncLookUI() {
   $('toneRange').value = state.tone;
   $('toneVal').textContent = Math.abs(state.tone) < 0.02 ? 'Neutral' : (state.tone > 0 ? 'Warm ' : 'Cool ') + Math.round(Math.abs(state.tone) * 100) + '%';
   $('aoRange').value = state.ao; $('aoVal').textContent = state.ao < 0.02 ? 'Off' : Math.round(state.ao * 100) + '%';
-  if (state.cel) $('aoVal').textContent = 'Off in cel shading';
+  if (!state.shadows) $('aoVal').textContent = 'Off while Shadows is off';
+  else if (state.cel) $('aoVal').textContent = 'Off in cel shading';
   $('sum-look').textContent = $('toneVal').textContent + ' tone \u00b7 occlusion ' + $('aoVal').textContent.toLowerCase();
-  dim($('aoRange').closest('.ctrl'), state.cel);
+  dim($('aoRange').closest('.ctrl'), state.cel || !state.shadows);
   $('shadowTint').querySelector('.color-chip').style.background = state.shadowColor;
   $('shadowTintVal').textContent = state.shadowColor.toUpperCase();
 }
@@ -4883,6 +4914,13 @@ function closeColorPicker() { cp.el.hidden = true; cp.cb = null; cp.trigger = nu
   $('cpHex').addEventListener('input', e => {
     let v = e.target.value.trim(); if (v[0] !== '#') v = '#' + v;
     if (/^#[0-9a-f]{6}$/i.test(v)) { Object.assign(cp, hexToHsv(v.toLowerCase())); cpRender(true); if (cp.cb) cp.cb(cpHex()); }
+  });
+  // When you leave the field (or press Enter): accept short #RGB codes, and put back the current colour
+  // if what was typed isn't a colour, so the field never shows something that isn't applied.
+  $('cpHex').addEventListener('change', e => {
+    let v = e.target.value.trim(); if (v[0] !== '#') v = '#' + v;
+    if (/^#[0-9a-f]{3}$/i.test(v)) { v = '#' + v.slice(1).split('').map(c => c + c).join(''); Object.assign(cp, hexToHsv(v.toLowerCase())); cpEmit(); }
+    e.target.value = cpHex().toUpperCase();
   });
   $('cpChips').addEventListener('click', e => {
     const ch = e.target.closest('.chip'); if (!ch) return;
